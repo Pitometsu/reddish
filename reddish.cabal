@@ -25,6 +25,7 @@ library
     exposed-modules:  Reddish
                       Reddish.RESP
                       Reddish.Commands
+                      Reddish.Driver
 
     -- Modules included in this library but not exported.
     -- other-modules:
@@ -35,6 +36,7 @@ library
                     , binary
                     , bytestring
                     , either
+                    , exceptions
                     , mtl
                     , network-simple
                     -- , singleton-nats
@@ -44,6 +46,7 @@ library
     default-language: Haskell2010
     default-extensions: BangPatterns
                       , BlockArguments
+                      , ConstraintKinds
                       , DataKinds
                       , DeriveGeneric
                       , DerivingStrategies
@@ -76,8 +79,10 @@ library
 
 test-suite reddish
     default-language: Haskell2010
+    default-extensions: PackageImports
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Reddish.hs
     build-depends:    base ^>=4.14.1.0
+                    , reddish
     ghc-options:      -main-is Reddish.test

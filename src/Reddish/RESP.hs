@@ -2,13 +2,13 @@ module Reddish.RESP where
 
 import Prelude hiding (String, Integer, length, null)
 import qualified Prelude (String, Integer, length)
-import Control.Applicative (empty)
+import Control.Applicative (empty, liftA2)
 import Control.Arrow ((>>>), first)
 import Control.Monad (guard, join)
 import Data.Traversable (for)
 import Data.Binary (Binary, get, put)
 import Data.Binary.Put (putBuilder, putLazyByteString)
-import Data.Binary.Get (getInt64host, getWord8, runGet)
+import Data.Binary.Get (getInt64host, getWord8, lookAhead, runGet)
 import Data.Binary.Get.Internal (Consume, Get, failOnEOF, getByteString, runCont, withInputChunks)
 import Data.Bits (toIntegralSized)
 import qualified Data.ByteString as B
@@ -25,7 +25,7 @@ import Data.Function ((&))
 import Data.Functor ((<&>))
 import Data.Int (Int64)
 import Data.Kind (Constraint, Type)
-import Data.Maybe (isJust, maybe)
+import Data.Maybe (fromMaybe, isJust, maybe)
 import Data.Monoid (getSum)
 import Data.Proxy (pattern Proxy)
 import Data.Text (Text)
@@ -82,8 +82,23 @@ pattern BulkString { unBulkString } <- BulkString_ !unBulkString where
     where
     sizeLimit = 536_870_912 -- 512 Mb bytes count
 
--- data Array :: [Type] -> Type where
---   Array_ :: { unArray_ :: Maybe (HList elems) } -> Array elems
+-- existential wrapper for the Array
+data SomeArray :: Type where
+  SomeArray_ :: forall (elemTypes :: [RESPKind]) (elems :: [Type])
+    . (elemTypes ~ MapToKind elems
+      , elems ~ MapFromKind elemTypes
+      , The elems '[RFoldMap, ReifyConstraint ToRESPTerm Identity])
+    => !(Maybe (HList elems)) -> SomeArray
+
+-- ???: is maxBound @Word or @Int64 -- the maximum array size
+-- | smart constructor
+pattern SomeArray
+  :: ()
+  => (elemTypes ~ MapToKind elems
+    , elems ~ MapFromKind elemTypes
+    , The elems '[RFoldMap, ReifyConstraint ToRESPTerm Identity])
+  =>  Maybe (HList elems) -> SomeArray
+pattern SomeArray unSomeArray = SomeArray_ unSomeArray
 
 data Array :: [RESPKind] -> Type where
   Array_ :: forall (elemTypes :: [RESPKind]) (elems :: [Type])
@@ -93,14 +108,16 @@ data Array :: [RESPKind] -> Type where
 
 -- ???: is maxBound @Word or @Int64 -- the maximum array size
 -- | smart constructor
--- pattern Array :: HList (MapFromKind elems) -> Array elems
 pattern Array :: forall (elemTypes :: [RESPKind]) (elems :: [Type])
   . (elemTypes ~ MapToKind elems, elems ~ MapFromKind elemTypes)
   =>  HList elems -> Array elemTypes
 pattern Array { unArray } = Array_ unArray
 
--- | smart constructor
-pattern ArrayNull :: Array '[]
+-- -- | smart constructor
+pattern ArrayNull :: forall (elems :: [RESPKind])
+  . ()
+  => (elems ~ '[])
+  => Array elems
 pattern ArrayNull = ArrayNull_
 
 deriving instance forall (elems :: [RESPKind])
@@ -117,10 +134,8 @@ instance RESPPrefix Integer where prefix = const ':'
 instance RESPPrefix BulkString where prefix = const '$'
 instance RESPPrefix Array where prefix = const '*'
 
--- instance RESPPrefix (Array '[]) where prefix = const '*'
--- instance forall (elem :: Type) (elems :: [Type]). (RESP elem, RESP (Array elems)) => RESPPrefix (Array (elem:elems)) where prefix (p :: proxy _) = prefix (p :: proxy (Array elems))
-
-type RESP :: Type -> Constraint
+{-
+type RESP :: Type -> Constraint -- constrain target type over ToRESPTerm'
 type family RESP term where
   RESP String = ()
   RESP Error = ()
@@ -129,6 +144,22 @@ type family RESP term where
   RESP (Array '[]) = ()
   forall (elem :: RESPKind) (elems :: [RESPKind]). RESP (Array (elem : elems))
     = (RESP (FromKind elem), RESP (Array elems))
+-}
+
+class ToRESPTerm term where
+  toTerm :: term -> RESPTerm (ToKind term)
+instance ToRESPTerm String where toTerm = RESPString
+instance ToRESPTerm Error where toTerm = RESPError
+instance ToRESPTerm Integer where toTerm = RESPInteger
+instance ToRESPTerm BulkString where toTerm = RESPBulkString
+instance forall (elemTypes :: [RESPKind]) (elems :: [Type])
+  . (elemTypes ~ MapToKind elems
+    , elems ~ MapFromKind elemTypes
+    , The elems '[RFoldMap, ReifyConstraint ToRESPTerm Identity])
+  => ToRESPTerm (Array elemTypes) where toTerm = RESPArray @elemTypes
+-- proxy instance for vinyl's identity
+instance ToRESPTerm term => ToRESPTerm (Identity term) where
+   toTerm (Identity term) = toTerm term
 
 data RESPKind :: Type where
   StringType :: RESPKind
@@ -145,7 +176,6 @@ type family FromKind kind = resp | resp -> kind where
   FromKind IntegerType = Integer
   FromKind BulkType = BulkString
   forall (elems :: [RESPKind]). FromKind (ArrayType elems) = Array elems
-  -- forall (elems :: [RESPKind]). FromKind (ArrayType elems) = Array (MapFromKind elems)
 
 -- helper map
 type family MapFromKind (elems :: [RESPKind]) :: [Type] where
@@ -153,60 +183,68 @@ type family MapFromKind (elems :: [RESPKind]) :: [Type] where
    MapFromKind (elem : elems) = FromKind elem : MapFromKind elems
 
 type ToKind :: Type -> RESPKind
-type family ToKind resp = kind | kind -> resp where
+-- type family ToKind resp = kind | kind -> resp where
+type family ToKind resp = kind where
   ToKind String = StringType
   ToKind Error = ErrorType
   ToKind Integer = IntegerType
   ToKind BulkString = BulkType
   forall (elems :: [RESPKind]). ToKind (Array elems) = ArrayType elems
-  -- forall (elems :: [Type]). ToKind (Array elems) = ArrayType (MapToKind elems)
+  -- toKind proxy instance for vinyl's identity
+  ToKind (Identity term) = ToKind term
+
+-- type HasKind :: (Type -> Type) -> Type -> Type RESPKind
+-- type family HasKind wrapper resp = kind | kind -> resp where
+--   HasKind Identity resp = ToKind resp
 
 -- helper map
 type family MapToKind (elems :: [Type]) :: [RESPKind] where
    MapToKind '[] = '[]
    MapToKind (elem : elems) = ToKind elem : MapToKind elems
 
--- ???: index dataKind and toIndex and fromIndex type families?
--- AND use witness as a list of such types!!!
 -- | plain type-indexed labeled sum of 'RESP' types
-
 data RESPTerm :: RESPKind -> Type where
   RESPString :: String -> RESPTerm (ToKind String)
   RESPError :: Error -> RESPTerm (ToKind Error)
   RESPInteger :: Integer -> RESPTerm (ToKind Integer)
   RESPBulkString :: BulkString -> RESPTerm (ToKind BulkString)
-  RESPArray :: forall (elems :: [RESPKind]). RESP (Array elems)
-    => Array elems -> RESPTerm (ToKind (Array elems))
+  RESPArray :: forall (elemTypes :: [RESPKind]) (elems :: [Type])
+    . (elemTypes ~ MapToKind elems
+      , elems ~ MapFromKind elemTypes
+      , The elems '[RFoldMap, ReifyConstraint ToRESPTerm Identity])
+    => Array elemTypes -> RESPTerm (ToKind (Array elemTypes))
 
 data RESPTerm' :: Type where
   RESPString' :: RESPTerm (ToKind String) -> RESPTerm'
   RESPError' :: RESPTerm (ToKind Error) -> RESPTerm'
   RESPInteger' :: RESPTerm (ToKind Integer) -> RESPTerm'
   RESPBulkString' :: RESPTerm (ToKind BulkString) -> RESPTerm'
-  -- RESPArray' :: forall (elems :: [RESPKind]). (RESP (Array elems), Binary (Array elems))
-  --   => RESPTerm (ToKind (Array elems)) -> RESPTerm'
-
   RESPArray' :: forall (elemTypes :: [RESPKind]) (elems :: [Type])
-    . (elemTypes ~ MapToKind elems, elems ~ MapFromKind elemTypes
-      , RESP (Array elemTypes), Binary (Array elemTypes))
-    => RESPTerm (ArrayType elemTypes) -> RESPTerm'
+    . (elemTypes ~ MapToKind elems
+      , elems ~ MapFromKind elemTypes
+      , The elems '[RFoldMap, ReifyConstraint ToRESPTerm Identity])
+    => RESPTerm (ToKind (Array elemTypes)) -> RESPTerm'
 
--- data RESPTerm' :: Type -> Type -> Type -> Type -> Type -> Type where
---   RESPString' :: forall err int bulk arr. String -> RESPTerm' String err int bulk arr
---   RESPError' :: forall str int bulk arr. Error -> RESPTerm' str Error int bulk arr
---   RESPInteger' :: forall str err bulk arr. Integer -> RESPTerm' str err Integer bulk arr
---   RESPBulkString' :: forall str err int arr. BulkString -> RESPTerm' str err int BulkString arr
---   RESPArray' :: forall str err int bulk (elems :: [Type]). RESP (Array elems)
---     => Array elems -> RESPTerm' str err int bulk (Array elems)
+someTerm :: forall (term :: RESPKind). RESPTerm term -> RESPTerm'
+someTerm = \case
+  term@(RESPString _) -> RESPString' term
+  term@(RESPError _) -> RESPError' term
+  term@(RESPInteger _) -> RESPInteger' term
+  term@(RESPBulkString _) -> RESPBulkString' term
+  term@(RESPArray _) -> RESPArray' term
 
 --
 -- Serializing
 --
 
+{-
 class ToRESP toSerialize where
-  toRESP :: RESP term => toSerialize -> term
+  type ToSerialize :: RESPKind
+  toRESP :: toSerialize -> RESPTerm ToSerialize
 class FromRESP toDeserialize where
-  fromRESP :: RESP term => RESPTerm (ToKind term) -> Maybe toDeserialize
+  type ToDeserialize :: RESPKind
+  fromRESP :: RESPTerm (ToKind ToDeserialize) -> toDeserialize
+-}
 
 instance Binary RESPTerm' where
   put = \case
@@ -214,15 +252,20 @@ instance Binary RESPTerm' where
     RESPError' (RESPError term) -> put term
     RESPInteger' (RESPInteger term) -> put term
     RESPBulkString' (RESPBulkString term) -> put term
-    RESPArray' (RESPArray term) -> put term
+    RESPArray' (RESPArray (Array term)) -> put . SomeArray $ pure term
+    RESPArray' (RESPArray ArrayNull) -> put $ SomeArray @'[] mempty
+
   get = do
-    prefix' <- w2c <$> getWord8
+    prefix' <- lookAhead get
     if
       | prefix' == prefix (Proxy @String) -> RESPString' . RESPString <$> get @String
       | prefix' == prefix (Proxy @Error) -> RESPError' . RESPError <$> get @Error
       | prefix' == prefix (Proxy @Integer) -> RESPInteger' . RESPInteger <$> get @Integer
       | prefix' == prefix (Proxy @BulkString) -> RESPBulkString' . RESPBulkString <$> get @BulkString
-      | prefix' == prefix (Proxy @Array) -> RESPArray' . RESPArray <$> get @(Array '[])
+      | prefix' == prefix (Proxy @Array) -> get @SomeArray <&>
+        \case
+          (SomeArray Nothing) -> RESPArray' $ RESPArray ArrayNull
+          (SomeArray (Just hlist)) -> RESPArray' . RESPArray $ Array hlist
 
 null :: ByteString
 null = "-1"
@@ -268,7 +311,7 @@ udecimal = B.span (isDigit . w2c) >>> \case
   go result (w2c -> digit) = do
     step <- result
       <&> \num ->
-      (fromIntegral @_ @Prelude.Integer num) * base -- FIXME: /fromIntegral/toIntegralSized/
+      fromIntegral @_ @Prelude.Integer num * base -- FIXME: /fromIntegral/toIntegralSized/
       + fromIntegral (digitToInt digit)
     guard $ step <= fromIntegral (maxBound @int)
     pure $ fromIntegral step
@@ -286,7 +329,7 @@ decimal () str = maybe (udecimal' False str) (udecimal' True)
 
 -- | consume simple byte string without intermediate \r or \n characters
 simpleString :: Consume ()
-simpleString () = pure . B.break (\char -> char `B.elem` crlf')
+simpleString () = pure . B.break (`B.elem` crlf')
 
 -- | get simple byte string without intermediate
 -- \r or \n characters, terminated by \r\n.
@@ -312,34 +355,45 @@ getBulk = do
       _ -> empty
     $ toIntegralSized size
 
--- getArray :: Get (Array elems)
+getArray :: Get SomeArray
 getArray = do
-  get @RESPTerm' >>= \case
-    RESPArray' (RESPArray term) -> pure term
-    _ -> empty
-  -- size <- getInt64DecCRLF
-  -- maybe empty
-  --   \case
-  --     (-1) -> pure ArrayNull
-  --     elemNum | elemNum > 0 -> replicateM elemNum (get @RESPTerm') <&> \case
-  --       RESPString' (RESPString term) -> term
-  --       RESPError' (RESPError term) -> term
-  --       RESPInteger' (RESPInteger term) -> term
-  --       RESPBulkString' (RESPBulkString term) -> term
-  --       RESPArray' (RESPArray term) -> term
-  --     _ -> empty
-  --   $ toIntegralSized size
-  -- where
-  -- replicateM :: forall m (elemTypes :: [RESPKind]) (elem :: Type)
-  --   . (elem ~ FromKind (ToKind elemTypes)
-  --     , Applicative m)
-  --   => Int -> m (forall (elem :: Type). elem ~ FromKind (ToKind elemTypes) => elem) -> m HList elems
-  -- replicateM cnt0 f =
-  --   loop cnt0
-  --   where
-  --   loop cnt
-  --     | cnt <= 0  = pure []
-  --     | otherwise = liftA2 (:) f (loop (cnt - 1))
+  size <- getInt64DecCRLF
+  maybe empty (\case
+    (-1) -> pure $ SomeArray @'[] mempty
+    elemNum | elemNum > 0 -> hreplicateM elemNum $ get @RESPTerm'
+    _ -> empty)
+    $  toIntegralSized size
+  where
+  hreplicateM :: Applicative m => Int -> m RESPTerm' -> m SomeArray
+  hreplicateM times f = loop times
+    where
+    loop cnt
+      | cnt <= 0  = pure . SomeArray $ pure RNil
+      | otherwise = liftA2
+        (\elem -> \case
+          (SomeArray Nothing) ->
+            let
+              add :: forall (term :: Type). (term ~ FromKind (ToKind term), ToRESPTerm term)
+                => term -> SomeArray
+              add elem' = SomeArray . pure $ Identity elem' :& RNil
+            in case elem of
+              RESPString' (RESPString term) -> add term
+              RESPError' (RESPError term) -> add term
+              RESPInteger' (RESPInteger term) -> add term
+              RESPBulkString' (RESPBulkString term) -> add term
+              RESPArray' (RESPArray term) -> add term
+          (SomeArray (Just elems)) ->
+            let
+              add :: forall (term :: Type). (term ~ FromKind (ToKind term), ToRESPTerm term)
+                => term -> SomeArray
+              add elem' = SomeArray . pure $ Identity elem' :& elems
+            in case elem of
+              RESPString' (RESPString term) -> add term
+              RESPError' (RESPError term) -> add term
+              RESPInteger' (RESPInteger term) -> add term
+              RESPBulkString' (RESPBulkString term) -> add term
+              RESPArray' (RESPArray term) -> add term)
+        f (loop (cnt - 1))
 
 instance Binary String where
   put string =  put (prefix $ Proxy @String)
@@ -378,73 +432,28 @@ instance Binary BulkString where
     prefix' <- get
     guard $ prefix' == prefix (Proxy @BulkString)
     BulkString <$> getBulk
--- instance Binary (Array '[]) where
---   put (unArray -> hlist) = case hlist of
---     Nothing -> undefined
---     Just hlist -> put '*'
---      <> (putBuilder . int64Dec . fromIntegral) (Prelude.length (rfoldMap ((:[]) . ForAll @'[] . getIdentity) hlist))
---      <> putLazyByteString crlf
---   get = undefined
--- instance forall (elem :: Type) (elems :: [Type]). (Binary elem, Binary (Array elems)) => Binary (Array (elem:elems)) where
--- instance forall (elem :: Type) (elems :: [Type]). (Binary elem, RFoldMap elems, ReifyConstraint Binary Identity elems) => Binary (Array (elem:elems)) where
-
-instance {-# OVERLAPS #-} Binary (Array '[])
+instance Binary SomeArray
   where
   put = \case
-    ArrayNull -> put (prefix $ Proxy @Array)
+    (SomeArray Nothing) -> put (prefix $ Proxy @Array)
       <> putLazyByteString null
       <> putLazyByteString crlf
-    Array hlist -> let
-      elems = reifyConstraint @Binary hlist
-        & rfoldMap \(Compose (Dict elem)) -> [ForAll @'[Binary] elem]
-      in put (prefix $ Proxy @Array)
-      <> (putBuilder . int64Dec . fromIntegral) (Prelude.length elems)
-      <> mconcat (elems <&> \(ForAll elem) -> put elem)
-      <> putLazyByteString crlf
-  get = do
-    prefix' <- get
-    guard $ prefix' == prefix (Proxy @Array)
-    undefined
-
-instance {-# OVERLAPPABLE #-} forall (elemTypes :: [RESPKind]) (elems :: [Type]) (e :: RESPKind) (es :: [RESPKind])
-  . (The elems '[RFoldMap, ReifyConstraint Binary Identity]
-    , elemTypes ~ (e:es)
-    , elemTypes ~ MapToKind elems
-    , elems ~ MapFromKind elemTypes)
-  => Binary (Array elemTypes)
-  where
-  put = \case
-    Array hlist -> let
-      elems = reifyConstraint @Binary hlist
-        & rfoldMap \(Compose (Dict elem)) -> [ForAll @'[Binary] elem]
+    (SomeArray (Just hlist)) -> let
+      elems = reifyConstraint @ToRESPTerm hlist & rfoldMap \case
+        (Compose (Dict elem)) -> [ForAll @'[ToRESPTerm] elem]
       in put (prefix $ Proxy @Array)
       <> (putBuilder . int64Dec . fromIntegral) (Prelude.length elems)
       <> putLazyByteString crlf
-      <> mconcat (elems <&> \(ForAll elem) -> put elem)
+      <> mconcat (elems <&> \(ForAll elem) -> put . someTerm $ toTerm elem)
   get = do
     prefix' <- get
     guard $ prefix' == prefix (Proxy @Array)
-    undefined
-
--- binary orphane for vinyl
-instance Binary a => Binary (Identity a) where
-  put (Identity x) = put x
-  get = Identity <$> get
-
-type Each :: forall typ. (typ -> Constraint) -> [typ] -> Constraint
-type family Each constraint types where
-  Each constraint '[] = ()
-  Each constraint (typ : rest) = (constraint typ, Each constraint rest)
+    getArray
 
 type The :: forall typ. typ -> [typ -> Constraint] -> Constraint
 type family The constraint types where
   The typ '[] = ()
   The typ (constraint : rest) = (constraint typ, The typ rest)
-
--- type All :: [Constraint] -> Constraint
--- type family All constraints where
---   All '[] = ()
---   All (constraint : rest) = (constraint, All rest)
 
 data ForAll (constraints :: [Type -> Constraint])
   = forall (typ :: Type). The typ constraints => ForAll typ

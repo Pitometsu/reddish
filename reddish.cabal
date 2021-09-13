@@ -37,6 +37,7 @@ library
                     , either
                     , mtl
                     , network-simple
+                    -- , singleton-nats
                     , text
                     , vinyl
     hs-source-dirs:   src

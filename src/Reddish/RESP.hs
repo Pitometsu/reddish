@@ -197,6 +197,8 @@ data Term :: RESP -> Type where
       , Terms elems)
     => Array elemTypes -> Term (ToKind (Array elemTypes))
 
+deriving instance forall (elem :: RESP). Show (Term elem)
+
 data SomeTerm :: Type where
   SomeTermString :: Term (ToKind String) -> SomeTerm
   SomeTermError :: Term (ToKind Error) -> SomeTerm
@@ -206,6 +208,8 @@ data SomeTerm :: Type where
     . (elemTypes ~ MapToKind elems, elems ~ MapFromKind elemTypes
       , Terms elems)
     => Term (ToKind (Array elemTypes)) -> SomeTerm
+
+deriving instance Show SomeTerm
 
 someTerm :: forall (term :: RESP). Term term -> SomeTerm
 someTerm = \case
